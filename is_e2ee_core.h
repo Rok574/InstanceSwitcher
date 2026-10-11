@@ -53,6 +53,15 @@ int is_hpke_seal_det(const uint8_t sk_e[32], const uint8_t pk[32], const uint8_t
                      const uint8_t *aad, size_t aad_len, const uint8_t *pt, size_t pt_len,
                      uint8_t enc_out[32], uint8_t *ct_out);
 
+// ---- v14: standard Ed25519 (RFC 8032, SHA-512) -------------------------------------------------------------------
+// monocypher's own EdDSA uses BLAKE2b and is NOT interoperable; these build real Ed25519 from its primitives.
+
+void is_sha512(const uint8_t *data, size_t len, uint8_t out[64]);
+void is_ed25519_public_key(const uint8_t seed[32], uint8_t pk[32]);
+void is_ed25519_sign(const uint8_t seed[32], const uint8_t *msg, size_t len, uint8_t sig[64]);
+// Returns 1 if the signature is valid, 0 otherwise.
+int is_ed25519_verify(const uint8_t sig[64], const uint8_t pk[32], const uint8_t *msg, size_t len);
+
 // Argon2id, 32-byte output. mem_kib = memory in KiB. Returns 0 on success, -1 on allocation failure.
 int is_argon2id(const uint8_t *pw, size_t pw_len, const uint8_t *salt, size_t salt_len,
                 uint32_t mem_kib, uint32_t iters, uint32_t lanes, uint8_t out[32]);
