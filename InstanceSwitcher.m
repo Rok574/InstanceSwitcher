@@ -190,6 +190,8 @@ static void IS_TokForgetId(NSString *iid) {
 
 #pragma mark - E2EE key storage (read-only decryption)
 
+static NSMutableDictionary *gPlainUntil;
+static NSObject *gPlainLock;
 static NSMutableDictionary *gE2ee;      // instance id -> @{ @"user": user id, @"sk": base64url backup private key }
 static NSObject *gE2eeLock;
 static NSString *const kE2eeFallbackKey = @"InstanceSwitcher.e2ee.fallback";
@@ -207,6 +209,8 @@ static void IS_E2eePersist(void) {      // call with gE2eeLock held
 }
 
 static void IS_E2eeLoad(void) {
+    gPlainLock = [NSObject new];
+    gPlainUntil = [NSMutableDictionary dictionary];
     gE2eeLock = [NSObject new];
     gE2ee = [NSMutableDictionary dictionary];
     NSData *d = IS_KCGetFor(@"e2ee");
@@ -1193,6 +1197,19 @@ static id IS_SyncJSON(NSString *method, NSString *url, NSString *token, id body,
     return e ? nil : result;
 }
 
+static BOOL IS_E2eeKnownPlain(NSString *channel) {
+    if (!gPlainLock) return NO;
+    @synchronized (gPlainLock) {
+        NSDate *until = gPlainUntil[channel];
+        return until && until.timeIntervalSinceNow > 0;
+    }
+}
+
+static void IS_E2eeMarkPlain(NSString *channel) {
+    if (!gPlainLock) return;
+    @synchronized (gPlainLock) { gPlainUntil[channel] = [NSDate dateWithTimeIntervalSinceNow:30]; }
+}
+
 // 1 = encrypted, 0 = plain, -1 = couldn't tell (the caller must not send anything). base is ".../api/v9".
 static int IS_E2eeIsEncrypted(NSString *base, NSString *token, NSString *channel) {
     static NSMutableSet *encrypted, *plain;
@@ -1221,6 +1238,7 @@ static int IS_E2eeIsEncrypted(NSString *base, NSString *token, NSString *channel
             if ([encrypted containsObject:channel]) return 1;
         }
     }
+    IS_E2eeMarkPlain(channel);
     return 0;
 }
 
@@ -1288,17 +1306,27 @@ static NSString *IS_E2eeVerifyUser(NSString *uid, id keys, BOOL own, NSMutableAr
 }
 
 // Builds the signed envelope for a new message. base is ".../api/v9". Returns nil and sets why on failure.
-static NSDictionary *IS_E2eeBuildEnvelope(NSString *base, NSString *token, NSString *channel, NSString *nonce, NSString *text, NSString **why) {
+static NSDictionary *IS_E2eeBuildEnvelope(NSString *base, NSString *token, NSString *channel, NSString *nonce, NSString *text, BOOL fresh, NSString **why) {
     NSDictionary *st = IS_E2eeEntry();
     NSData *seed = IS_B64uData(st[@"dev_seed"]), *bsk = IS_B64uData(st[@"sk"]);
     NSString *uid = st[@"user"], *devId = st[@"dev_id"];
     if (!IS_E2eeCanSend() || seed.length != 32 || bsk.length != 32) { *why = @"Encrypted sending isn't set up. Unlock encrypted messages again."; return nil; }
 
+    static NSMutableDictionary *dirCache; static NSObject *dirLock; static dispatch_once_t dirOnce;
+    dispatch_once(&dirOnce, ^{ dirCache = [NSMutableDictionary dictionary]; dirLock = [NSObject new]; });
     NSString *err = nil; NSInteger code = 0;
-    id res = IS_SyncJSON(@"POST", [base stringByAppendingString:@"/e2ee/keys/query"], token, @{ @"channel_id": channel }, &code, &err);
-    if (!res || code != 200 || ![res[@"users"] isKindOfClass:NSDictionary.class] || ![res[@"channel_members"] isKindOfClass:NSArray.class]) {
-        *why = [NSString stringWithFormat:@"Couldn't fetch the encryption keys (%@).", err ?: [NSString stringWithFormat:@"server answered %ld", (long)code]];
-        return nil;
+    id res = nil;
+    @synchronized (dirLock) {
+        NSDictionary *hit = dirCache[channel];
+        if (!fresh && hit && -[hit[@"at"] timeIntervalSinceNow] < 30) res = hit[@"res"];
+    }
+    if (!res) {
+        res = IS_SyncJSON(@"POST", [base stringByAppendingString:@"/e2ee/keys/query"], token, @{ @"channel_id": channel }, &code, &err);
+        if (!res || code != 200 || ![res[@"users"] isKindOfClass:NSDictionary.class] || ![res[@"channel_members"] isKindOfClass:NSArray.class]) {
+            *why = [NSString stringWithFormat:@"Couldn't fetch the encryption keys (%@).", err ?: [NSString stringWithFormat:@"server answered %ld", (long)code]];
+            return nil;
+        }
+        @synchronized (dirLock) { dirCache[channel] = @{ @"at": [NSDate date], @"res": res }; }
     }
     NSMutableArray *targets = [NSMutableArray array], *backups = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
@@ -1840,7 +1868,9 @@ static NSString *const kISHandled = @"InstanceSwitcher.handled";
     if (post) {     // outgoing messages (and file upload slots) in a channel: sealed here when the channel is encrypted
         if (!IS_E2eeCanSend()) return NO;
         if ([[request valueForHTTPHeaderField:@"Content-Type"].lowercaseString containsString:@"multipart"]) return NO;
-        return [p rangeOfString:@"^/api/v[0-9]+/channels/[0-9]+/(messages|attachments)$" options:NSRegularExpressionSearch].location != NSNotFound;
+        if ([p rangeOfString:@"^/api/v[0-9]+/channels/[0-9]+/(messages|attachments)$" options:NSRegularExpressionSearch].location == NSNotFound) return NO;
+        NSArray *seg = [p componentsSeparatedByString:@"/"];
+        return !IS_E2eeKnownPlain(seg.count > 4 ? seg[4] : @"");
     }
     if ([p hasPrefix:@"/e2ee/attachments/"]) return YES;
     if ([p hasPrefix:@"/api/"] && ([p containsString:@"/messages"] || [p hasSuffix:@"/pins"])) return YES;
@@ -1970,7 +2000,7 @@ static NSData *IS_ReadStream(NSInputStream *in) {
 
             for (int attempt = 0; attempt < 2; attempt++) {
                 NSString *why = nil;
-                NSDictionary *env = IS_E2eeBuildEnvelope(base, token, channel, nonce, obj[@"content"], &why);
+                NSDictionary *env = IS_E2eeBuildEnvelope(base, token, channel, nonce, obj[@"content"], attempt > 0, &why);
                 if (!env) { [self failSend:why ?: @"Couldn't encrypt the message."]; return; }
                 NSMutableDictionary *out = [obj mutableCopy];
                 out[@"encrypted"] = env;
