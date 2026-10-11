@@ -53,6 +53,10 @@ int is_b64u_encode(const uint8_t *in, size_t len, char *out, size_t cap) {
 }
 
 int is_random(uint8_t *buf, size_t n) {
+#if defined(__APPLE__)
+    arc4random_buf(buf, n);                   // always succeeds on iOS/macOS
+    return 0;
+#else
     while (n) {
         size_t t = n > 256 ? 256 : n;
         if (getentropy(buf, t) != 0) return -1;
@@ -60,6 +64,7 @@ int is_random(uint8_t *buf, size_t n) {
         n -= t;
     }
     return 0;
+#endif
 }
 
 /* --------------------------------------------------------------------- SHA-256 */
