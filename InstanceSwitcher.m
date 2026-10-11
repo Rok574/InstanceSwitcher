@@ -543,6 +543,43 @@ static void IS_HookNSURL(void) {
     }), method_getTypeEncoding(m));
 }
 
+#pragma mark - Video players (AVFoundation does not go through NSURLProtocol)
+
+static NSURL *IS_AVFix(NSURL *u, const char *who) {
+    if (![u isKindOfClass:NSURL.class]) return u;
+    NSURL *n = IS_Rewrite(u);
+    if (u.host.length && ([u.scheme hasPrefix:@"http"])) {
+        if (n != u && ![n isEqual:u]) IS_Log(@"video(%s): %@ -> %@", who, u.absoluteString, n.absoluteString);
+        else IS_Log(@"video(%s): %@ (unchanged)", who, u.absoluteString);
+    }
+    return n;
+}
+
+static void IS_HookAV(const char *cname, SEL sel, BOOL meta, BOOL hasOpts) {
+    Class cls = NSClassFromString([NSString stringWithUTF8String:cname]);
+    if (!cls) return;
+    Class target = meta ? object_getClass(cls) : cls;
+    Method m = class_getInstanceMethod(target, sel);
+    if (!m) return;
+    IMP orig = method_getImplementation(m);
+    const char *who = cname;
+    if (hasOpts) class_replaceMethod(target, sel, imp_implementationWithBlock(^id(id s, NSURL *u, id o) {
+        return ((id (*)(id, SEL, id, id))orig)(s, sel, IS_AVFix(u, who), o);
+    }), method_getTypeEncoding(m));
+    else class_replaceMethod(target, sel, imp_implementationWithBlock(^id(id s, NSURL *u) {
+        return ((id (*)(id, SEL, id))orig)(s, sel, IS_AVFix(u, who));
+    }), method_getTypeEncoding(m));
+}
+
+static void IS_HookVideo(void) {
+    IS_HookAV("AVURLAsset", @selector(initWithURL:options:), NO, YES);
+    IS_HookAV("AVURLAsset", @selector(URLAssetWithURL:options:), YES, YES);
+    IS_HookAV("AVPlayerItem", @selector(initWithURL:), NO, NO);
+    IS_HookAV("AVPlayerItem", @selector(playerItemWithURL:), YES, NO);
+    IS_HookAV("AVPlayer", @selector(initWithURL:), NO, NO);
+    IS_HookAV("AVPlayer", @selector(playerWithURL:), YES, NO);
+}
+
 #pragma mark - E2EE read-only decryption (meowcord / fosscord-e2ee v1)
 
 static NSMutableDictionary *gE2eeFiles;     // virtual attachment path -> @{ url, key, iv, content_type, filename }
@@ -2181,6 +2218,7 @@ static void IS_Init(void) {
             IS_HookSocketRocket(NSClassFromString(@"SRWebSocket"));
             IS_HookSocketRocket(NSClassFromString(@"RCTSRWebSocket"));
             IS_HookNSURL();
+            IS_HookVideo();
             [NSURLProtocol registerClass:ISImageProtocol.class];
             IS_HookConfig(NSURLSessionConfiguration.class);
             IS_HookConfig([NSURLSessionConfiguration defaultSessionConfiguration].class);
