@@ -62,6 +62,22 @@ void is_ed25519_sign(const uint8_t seed[32], const uint8_t *msg, size_t len, uin
 // Returns 1 if the signature is valid, 0 otherwise.
 int is_ed25519_verify(const uint8_t sig[64], const uint8_t pk[32], const uint8_t *msg, size_t len);
 
+// ---- v14: sending ----------------------------------------------------------------------------------------------
+
+typedef struct { const char *user_id; const char *device_id; int64_t prekey_id; uint8_t prekey_pub[32]; } is_env_target;
+typedef struct { const char *user_id; uint8_t pub[32]; } is_env_backup;
+
+// Builds the "encrypted" envelope (fosscord-e2ee v1) for one message and returns it as a malloc'd JSON string
+// (free() it), or NULL on failure. The payload (JSON text such as {"content":"hi"}) is AES-256-GCM sealed under a
+// fresh content key, the key is HPKE-wrapped to every target device prekey and every backup key, and the envelope is
+// signed with the sender device's Ed25519 key. nonce binds a new message; pass mid instead for an edit (nonce NULL).
+// All ids and the nonce must be plain [A-Za-z0-9_-] tokens.
+char *is_e2ee_seal_envelope(const char *channel_id, const char *sender_user_id, const char *sender_device_id,
+                            const uint8_t device_seed[32], const char *nonce, const char *mid,
+                            const uint8_t *payload, size_t payload_len,
+                            const is_env_target *targets, size_t ntargets,
+                            const is_env_backup *backups, size_t nbackups);
+
 // Argon2id, 32-byte output. mem_kib = memory in KiB. Returns 0 on success, -1 on allocation failure.
 int is_argon2id(const uint8_t *pw, size_t pw_len, const uint8_t *salt, size_t salt_len,
                 uint32_t mem_kib, uint32_t iters, uint32_t lanes, uint8_t out[32]);

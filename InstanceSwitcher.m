@@ -9,6 +9,7 @@
 #import <objc/message.h>
 #import <Security/Security.h>
 #import "is_e2ee_core.h"
+#import "monocypher.h"
 #include <string.h>
 #include <dlfcn.h>
 #include <sys/utsname.h>
@@ -1104,6 +1105,278 @@ static void IS_RemoveMenu(void) {
     [IS_Top() presentViewController:a animated:YES completion:nil];
 }
 
+#pragma mark - E2EE sending (device registration + envelope sealing)
+
+static NSString *const kE2eeFallbackText = @"\U0001F512 Encrypted message";
+
+static NSString *IS_B64uString(const uint8_t *d, size_t n) {
+    size_t cap = (n / 3 + 1) * 4 + 1;
+    char *buf = malloc(cap);
+    if (!buf) return nil;
+    NSString *s = is_b64u_encode(d, n, buf, cap) >= 0 ? [NSString stringWithUTF8String:buf] : nil;
+    free(buf);
+    return s;
+}
+
+static BOOL IS_EdVerify(id pub, id msg, id sig) {
+    NSData *p = IS_B64uData(pub), *s = IS_B64uData(sig);
+    if (p.length != 32 || s.length != 64 || ![msg isKindOfClass:NSString.class] || ![(NSString *)msg length]) return NO;
+    NSData *m = [(NSString *)msg dataUsingEncoding:NSUTF8StringEncoding];
+    return is_ed25519_verify(s.bytes, p.bytes, m.bytes, m.length) == 1;
+}
+
+static NSString *IS_EdSign(NSData *seed, NSString *msg) {
+    uint8_t sig[64];
+    NSData *m = [msg dataUsingEncoding:NSUTF8StringEncoding];
+    is_ed25519_sign(seed.bytes, m.bytes, m.length, sig);
+    return IS_B64uString(sig, 64);
+}
+
+static NSString *IS_DeviceIdFor(NSString *signingKey) {
+    NSData *raw = IS_B64uData(signingKey);
+    if (raw.length != 32) return nil;
+    uint8_t h[32];
+    is_sha256(raw.bytes, raw.length, h);
+    return IS_B64uString(h, 16);
+}
+
+static NSString *IS_DeviceMsg(NSString *uid, NSString *did, NSString *sk) { return [NSString stringWithFormat:@"fosscord-e2ee/v1/device\n%@\n%@\n%@", uid, did, sk]; }
+static NSString *IS_PrekeyMsg(NSString *did, long long pid, NSString *pub) { return [NSString stringWithFormat:@"fosscord-e2ee/v1/prekey\n%@\n%lld\n%@", did, pid, pub]; }
+static NSString *IS_RotationMsg(NSString *uid, NSString *prev, NSString *next) { return [NSString stringWithFormat:@"fosscord-e2ee/v1/identity-rotate\n%@\n%@\n%@", uid, prev, next]; }
+static NSString *IS_BackupKeyMsg(NSString *uid, NSString *pub) { return [NSString stringWithFormat:@"fosscord-e2ee/v1/backup-key\n%@\n%@", uid, pub]; }
+
+static void IS_E2eeMerge(NSString *iid, NSDictionary *fields) {
+    if (!gE2eeLock || !iid) return;
+    @synchronized (gE2eeLock) {
+        NSMutableDictionary *e = [gE2ee[iid] mutableCopy];
+        if (!e) return;
+        [e addEntriesFromDictionary:fields];
+        gE2ee[iid] = e;
+        IS_E2eePersist();
+    }
+}
+
+static BOOL IS_E2eeCanSend(void) {
+    NSDictionary *e = IS_E2eeEntry();
+    return e && IS_B64uData(e[@"dev_seed"]).length == 32 && [e[@"dev_id"] isKindOfClass:NSString.class] && [e[@"idpub"] isKindOfClass:NSString.class];
+}
+
+// Blocking JSON request. Returns the parsed body (or @{} for an empty one) and the HTTP status; nil on a transport error.
+static id IS_SyncJSON(NSString *method, NSString *url, NSString *token, id body, NSInteger *status, NSString **err) {
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) { if (err) *err = @"bad address"; return nil; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u];
+    r.HTTPMethod = method;
+    [r setValue:token forHTTPHeaderField:@"Authorization"];
+    if (body) {
+        r.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:NSJSONWritingWithoutEscapingSlashes error:nil];
+        [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    }
+    r.timeoutInterval = 20;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block id result = nil;
+    __block NSInteger code = 0;
+    __block NSString *e = nil;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *er) {
+        NSHTTPURLResponse *h = [resp isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)resp : nil;
+        if (er || !h) e = er.localizedDescription ?: @"no response";
+        else {
+            code = h.statusCode;
+            result = d.length ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingFragmentsAllowed error:nil] : @{};
+            if (!result) result = @{};
+        }
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (status) *status = code;
+    if (e && err) *err = e;
+    return e ? nil : result;
+}
+
+// 1 = encrypted, 0 = plain, -1 = couldn't tell (the caller must not send anything). base is ".../api/v9".
+static int IS_E2eeIsEncrypted(NSString *base, NSString *token, NSString *channel) {
+    static NSMutableSet *encrypted, *plain;
+    static NSDate *stateAt; static NSObject *lock; static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; encrypted = [NSMutableSet set]; plain = [NSMutableSet set]; });
+    BOOL needState = NO, known = NO;
+    @synchronized (lock) {
+        if ([encrypted containsObject:channel]) return 1;
+        known = [plain containsObject:channel];
+        needState = !stateAt || -[stateAt timeIntervalSinceNow] > 15;
+    }
+    NSString *err = nil; NSInteger st = 0;
+    if (!known) {
+        id info = IS_SyncJSON(@"GET", [NSString stringWithFormat:@"%@/channels/%@", base, channel], token, nil, &st, &err);
+        if (!info || st != 200 || ![info isKindOfClass:NSDictionary.class]) { IS_Log(@"e2ee send: couldn't read the channel (%@ %ld)", err ?: @"", (long)st); return -1; }
+        int type = [info[@"type"] intValue];
+        if (type == 1 || type == 3) { @synchronized (lock) { [encrypted addObject:channel]; } return 1; }
+        @synchronized (lock) { [plain addObject:channel]; }
+    }
+    if (needState) {
+        id state = IS_SyncJSON(@"GET", [base stringByAppendingString:@"/users/@me/e2ee"], token, nil, &st, &err);
+        if (!state || st != 200 || ![state[@"channels"] isKindOfClass:NSArray.class]) { IS_Log(@"e2ee send: couldn't read the encryption state (%@ %ld)", err ?: @"", (long)st); return -1; }
+        @synchronized (lock) {
+            for (id c in state[@"channels"]) if ([c isKindOfClass:NSString.class]) [encrypted addObject:c];
+            stateAt = [NSDate date];
+            if ([encrypted containsObject:channel]) return 1;
+        }
+    }
+    return 0;
+}
+
+static NSString *IS_E2eeIneligible(NSDictionary *o) {
+    if ([o[@"attachments"] isKindOfClass:NSArray.class] && [o[@"attachments"] count]) return @"Files can't be sent encrypted from this tweak yet.";
+    if ([o[@"sticker_ids"] isKindOfClass:NSArray.class] && [o[@"sticker_ids"] count]) return @"Stickers can't be sent encrypted yet.";
+    if (o[@"poll"] && o[@"poll"] != NSNull.null) return @"Polls can't be sent encrypted yet.";
+    if ([o[@"components"] isKindOfClass:NSArray.class] && [o[@"components"] count]) return @"This kind of message can't be sent encrypted yet.";
+    if ([o[@"tts"] boolValue]) return @"Text-to-speech messages can't be sent encrypted.";
+    id ref = o[@"message_reference"];
+    if ([ref isKindOfClass:NSDictionary.class] && [ref[@"type"] intValue] == 1) return @"Forwarded messages can't be sent encrypted yet.";
+    NSString *c = o[@"content"];
+    if (![c isKindOfClass:NSString.class] || ![[c stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] length]) return @"This kind of message can't be sent encrypted yet.";
+    return nil;
+}
+
+static NSString *IS_E2eePin(NSString *uid) {
+    NSDictionary *pins = IS_E2eeEntry()[@"pins"];
+    return [pins isKindOfClass:NSDictionary.class] ? pins[uid] : nil;
+}
+
+static void IS_E2eeSetPin(NSString *uid, NSString *key) {
+    NSMutableDictionary *pins = [([IS_E2eeEntry()[@"pins"] isKindOfClass:NSDictionary.class] ? IS_E2eeEntry()[@"pins"] : @{}) mutableCopy];
+    pins[uid] = key;
+    IS_E2eeMerge(gActive[@"id"], @{ @"pins": pins });
+}
+
+// Checks one user's published keys the way the web client does (identity pin, device signatures, prekey signatures,
+// backup key signature) and appends what is safe to encrypt to. Returns a reason on failure, nil on success.
+static NSString *IS_E2eeVerifyUser(NSString *uid, id keys, BOOL own, NSMutableArray *targets, NSMutableArray *backups) {
+    if (![keys isKindOfClass:NSDictionary.class]) return [NSString stringWithFormat:@"user %@ has no encryption keys yet", uid];
+    NSString *idkey = keys[@"identity_key"];
+    if (![idkey isKindOfClass:NSString.class] || IS_B64uData(idkey).length != 32) return [NSString stringWithFormat:@"user %@ has no encryption identity yet", uid];
+    NSDictionary *st = IS_E2eeEntry();
+    NSString *pinned = own ? st[@"idpub"] : IS_E2eePin(uid);
+    if (pinned && ![pinned isEqualToString:idkey]) {
+        NSDictionary *prev = keys[@"previous_identity"];
+        BOOL rotated = !own && [prev isKindOfClass:NSDictionary.class] && [prev[@"public_key"] isEqual:pinned] &&
+                       IS_EdVerify(pinned, IS_RotationMsg(uid, pinned, idkey), prev[@"signature"]);
+        if (!rotated) return own ? @"your encryption identity changed; unlock encrypted messages again"
+                                 : [NSString stringWithFormat:@"the safety number of user %@ changed; check it in the web client first", uid];
+    }
+    if (!own && ![pinned isEqualToString:idkey]) IS_E2eeSetPin(uid, idkey);
+
+    NSUInteger found = 0;
+    NSArray *devices = [keys[@"devices"] isKindOfClass:NSArray.class] ? keys[@"devices"] : @[];
+    for (id d in devices) {
+        if (![d isKindOfClass:NSDictionary.class] || ![d[@"status"] isEqual:@"active"]) continue;
+        NSString *did = d[@"device_id"], *sk = d[@"signing_key"];
+        NSDictionary *pk = [d[@"prekey"] isKindOfClass:NSDictionary.class] ? d[@"prekey"] : nil;
+        BOOL good = [did isKindOfClass:NSString.class] && [sk isKindOfClass:NSString.class] && pk && [pk[@"id"] isKindOfClass:NSNumber.class] &&
+                    [did isEqualToString:IS_DeviceIdFor(sk) ?: @""] && IS_B64uData(pk[@"public_key"]).length == 32 &&
+                    IS_EdVerify(idkey, IS_DeviceMsg(uid, did, sk), d[@"identity_signature"]) &&
+                    IS_EdVerify(sk, IS_PrekeyMsg(did, [pk[@"id"] longLongValue], pk[@"public_key"]), pk[@"signature"]);
+        if (!good) { IS_Log(@"e2ee send: ignoring a device of user %@ that failed verification", uid); continue; }
+        [targets addObject:@{ @"user": uid, @"dev": did, @"pid": pk[@"id"], @"pub": IS_B64uData(pk[@"public_key"]) }];
+        found++;
+    }
+    if (!found) return [NSString stringWithFormat:@"user %@ has no verified encryption devices", uid];
+
+    NSDictionary *bk = [keys[@"backup_key"] isKindOfClass:NSDictionary.class] ? keys[@"backup_key"] : nil;
+    if (bk && IS_B64uData(bk[@"public_key"]).length == 32 && IS_EdVerify(idkey, IS_BackupKeyMsg(uid, bk[@"public_key"]), bk[@"signature"]))
+        [backups addObject:@{ @"user": uid, @"pub": IS_B64uData(bk[@"public_key"]) }];
+    return nil;
+}
+
+// Builds the signed envelope for a new message. base is ".../api/v9". Returns nil and sets why on failure.
+static NSDictionary *IS_E2eeBuildEnvelope(NSString *base, NSString *token, NSString *channel, NSString *nonce, NSString *text, NSString **why) {
+    NSDictionary *st = IS_E2eeEntry();
+    NSData *seed = IS_B64uData(st[@"dev_seed"]), *bsk = IS_B64uData(st[@"sk"]);
+    NSString *uid = st[@"user"], *devId = st[@"dev_id"];
+    if (!IS_E2eeCanSend() || seed.length != 32 || bsk.length != 32) { *why = @"Encrypted sending isn't set up. Unlock encrypted messages again."; return nil; }
+
+    NSString *err = nil; NSInteger code = 0;
+    id res = IS_SyncJSON(@"POST", [base stringByAppendingString:@"/e2ee/keys/query"], token, @{ @"channel_id": channel }, &code, &err);
+    if (!res || code != 200 || ![res[@"users"] isKindOfClass:NSDictionary.class] || ![res[@"channel_members"] isKindOfClass:NSArray.class]) {
+        *why = [NSString stringWithFormat:@"Couldn't fetch the encryption keys (%@).", err ?: [NSString stringWithFormat:@"server answered %ld", (long)code]];
+        return nil;
+    }
+    NSMutableArray *targets = [NSMutableArray array], *backups = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    BOOL sawMe = NO;
+    for (id m in res[@"channel_members"]) {
+        if (![m isKindOfClass:NSString.class] || [seen containsObject:m]) continue;
+        [seen addObject:m];
+        BOOL own = [m isEqualToString:uid];
+        sawMe |= own;
+        NSString *bad = IS_E2eeVerifyUser(m, res[@"users"][m], own, targets, backups);
+        if (bad) { *why = [NSString stringWithFormat:@"Not sent: %@.", bad]; return nil; }
+    }
+    BOOL meListed = NO, backupListed = NO;
+    for (NSDictionary *t in targets) if ([t[@"user"] isEqual:uid] && [t[@"dev"] isEqual:devId]) meListed = YES;
+    for (NSDictionary *b in backups) if ([b[@"user"] isEqual:uid]) backupListed = YES;
+    if (!sawMe || !meListed) { *why = @"This device isn't registered for encryption. Unlock encrypted messages again."; return nil; }
+    if (!backupListed) {
+        uint8_t pub[32];
+        crypto_x25519_public_key(pub, bsk.bytes);
+        [backups addObject:@{ @"user": uid, @"pub": [NSData dataWithBytes:pub length:32] }];
+    }
+
+    NSData *payload = [NSJSONSerialization dataWithJSONObject:@{ @"content": text } options:NSJSONWritingWithoutEscapingSlashes error:nil];
+    if (!payload.length) { *why = @"Couldn't encode the message."; return nil; }
+    is_env_target *tg = calloc(targets.count, sizeof(is_env_target));
+    is_env_backup *bg = calloc(backups.count ?: 1, sizeof(is_env_backup));
+    NSDictionary *envelope = nil;
+    if (tg && bg) {
+        for (NSUInteger i = 0; i < targets.count; i++) {
+            NSDictionary *t = targets[i];
+            tg[i].user_id = [t[@"user"] UTF8String];
+            tg[i].device_id = [t[@"dev"] UTF8String];
+            tg[i].prekey_id = [t[@"pid"] longLongValue];
+            memcpy(tg[i].prekey_pub, [t[@"pub"] bytes], 32);
+        }
+        for (NSUInteger i = 0; i < backups.count; i++) {
+            bg[i].user_id = [backups[i][@"user"] UTF8String];
+            memcpy(bg[i].pub, [backups[i][@"pub"] bytes], 32);
+        }
+        char *json = is_e2ee_seal_envelope(channel.UTF8String, uid.UTF8String, devId.UTF8String, seed.bytes, nonce.UTF8String, NULL,
+                                           payload.bytes, payload.length, tg, targets.count, bg, backups.count);
+        if (json) {
+            id parsed = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytes:json length:strlen(json)] options:0 error:nil];
+            if ([parsed isKindOfClass:NSDictionary.class]) envelope = parsed;
+            free(json);
+        }
+    }
+    free(tg); free(bg);
+    if (!envelope) *why = @"Couldn't encrypt the message.";
+    return envelope;
+}
+
+// Registers this install as an encryption device (signed by your identity key from the backup).
+// Returns the fields to store, or nil with err set.
+static NSDictionary *IS_E2eeRegisterDevice(NSString *v9, NSString *token, NSString *uid, NSData *identitySeed, NSString *identityPub, NSString **err) {
+    uint8_t dseed[32], dpub[32], psk[32], ppub[32];
+    if (is_random(dseed, 32) != 0 || is_random(psk, 32) != 0) { *err = @"no randomness available"; return nil; }
+    is_ed25519_public_key(dseed, dpub);
+    crypto_x25519_public_key(ppub, psk);
+    NSString *signing = IS_B64uString(dpub, 32), *ppubS = IS_B64uString(ppub, 32);
+    NSString *did = IS_DeviceIdFor(signing);
+    NSData *dseedData = [NSData dataWithBytes:dseed length:32];
+    NSString *prekeySig = IS_EdSign(dseedData, IS_PrekeyMsg(did, 1, ppubS));
+    NSString *identitySig = IS_EdSign(identitySeed, IS_DeviceMsg(uid, did, signing));
+    NSInteger code = 0; NSString *e = nil;
+    id res = IS_SyncJSON(@"POST", [v9 stringByAppendingString:@"/users/@me/e2ee/devices"], token, @{
+        @"device_id": did, @"signing_key": signing, @"identity_signature": identitySig, @"name": @"Discord iOS (InstanceSwitcher)",
+        @"prekey": @{ @"id": @1, @"public_key": ppubS, @"signature": prekeySig } }, &code, &e);
+    if (!res || code != 200 || ![res[@"status"] isEqual:@"active"]) {
+        *err = e ?: [NSString stringWithFormat:@"server answered %ld", (long)code];
+        memset(dseed, 0, 32); memset(psk, 0, 32);
+        return nil;
+    }
+    NSDictionary *out = @{ @"idpub": identityPub, @"dev_seed": IS_B64uString(dseed, 32), @"dev_id": did, @"pk_sk": IS_B64uString(psk, 32), @"pk_id": @1 };
+    memset(dseed, 0, 32); memset(psk, 0, 32);
+    return out;
+}
+
 #pragma mark - Unlock (read-only encryption)
 
 static NSData *IS_OpenBox(NSData *key, NSString *box, NSString *aad) {
@@ -1153,6 +1426,8 @@ static id IS_SyncGet(NSString *url, NSString *token, NSString **err) {
     if (e) *err = e;
     return result;
 }
+
+static NSString *gUnlockNote;
 
 // Background work. Calls done(nil) on success or done(message) on failure.
 static void IS_E2eeUnlock(NSString *input, void (^done)(NSString *err)) {
@@ -1206,8 +1481,52 @@ static void IS_E2eeUnlock(NSString *input, void (^done)(NSString *err)) {
         if (sk.length != 32 || ![jwk[@"crv"] isEqual:@"X25519"]) { done(@"The backup unlocked, but its message key couldn't be read."); return; }
         if ([bk[@"backup_public_key"] isKindOfClass:NSString.class] && ![bk[@"backup_public_key"] isEqual:jwk[@"x"]]) { done(@"The backup's key doesn't match its public key."); return; }
 
+        NSString *oldDevice = IS_E2eeEntry()[@"dev_id"];
         IS_E2eeStore(iid, uid, jwk[@"d"]);
-        IS_Log(@"encryption: backup key unlocked for %@ (read-only)", gActive[@"name"]);
+        IS_Log(@"encryption: backup key unlocked for %@", gActive[@"name"]);
+
+        // Sending: open the identity key from the backup and register this install as a device signed by it.
+        gUnlockNote = nil;
+        uint8_t ikey[32];
+        const char *iinfo = "fosscord-e2ee/v1/backup/identity";
+        is_hkdf_sha256(secret.bytes, 32, NULL, 0, (const uint8_t *)iinfo, strlen(iinfo), ikey, 32);
+        NSData *idData = IS_OpenBox([NSData dataWithBytes:ikey length:32], bk[@"wrapped_identity"], [@"identity\n" stringByAppendingString:uid]);
+        memset(ikey, 0, sizeof ikey);
+        id ijwk = idData ? [NSJSONSerialization JSONObjectWithData:idData options:0 error:nil] : nil;
+        NSData *iseed = [ijwk isKindOfClass:NSDictionary.class] ? IS_B64uData(ijwk[@"d"]) : nil;
+        NSString *ipub = [ijwk isKindOfClass:NSDictionary.class] ? ijwk[@"x"] : nil;
+        uint8_t derived[32];
+        BOOL idOk = iseed.length == 32 && [ijwk[@"crv"] isEqual:@"Ed25519"] && [ipub isKindOfClass:NSString.class] && [ipub isEqual:bk[@"identity_key"]];
+        if (idOk) { is_ed25519_public_key(iseed.bytes, derived); idOk = [IS_B64uString(derived, 32) isEqualToString:ipub]; }
+        if (!idOk) {
+            gUnlockNote = @"Reading works, but sending encrypted messages isn't available: the identity key in your backup couldn't be read.";
+            IS_Log(@"encryption: identity key in the backup unreadable; sending stays off");
+            done(nil);
+            return;
+        }
+        NSString *regErr = nil;
+        NSString *v9 = [base stringByAppendingString:@"/v9"];
+        id state = IS_SyncGet([v9 stringByAppendingString:@"/users/@me/e2ee"], token, &regErr);
+        if (![state isKindOfClass:NSDictionary.class] || ![state[@"identity_key"] isEqual:ipub]) {
+            gUnlockNote = @"Reading works, but sending isn't available: your backup doesn't match your current encryption identity.";
+            IS_Log(@"encryption: backup identity differs from the account's current identity (%@)", regErr ?: @"mismatch");
+            done(nil);
+            return;
+        }
+        NSDictionary *fields = IS_E2eeRegisterDevice(v9, token, uid, iseed, ipub, &regErr);
+        if (!fields) {
+            gUnlockNote = [NSString stringWithFormat:@"Reading works, but this device couldn't be registered for sending (%@).", regErr];
+            IS_Log(@"encryption: device registration failed: %@", regErr);
+            done(nil);
+            return;
+        }
+        IS_E2eeMerge(iid, fields);
+        IS_Log(@"encryption: registered device %@, sending is on", fields[@"dev_id"]);
+        if (oldDevice.length) {
+            NSInteger dc = 0;
+            IS_SyncJSON(@"DELETE", [NSString stringWithFormat:@"%@/users/@me/e2ee/devices/%@", v9, oldDevice], token, nil, &dc, nil);
+            IS_Log(@"encryption: removed the previous device of this install (HTTP %ld)", (long)dc);
+        }
         done(nil);
     });
 }
@@ -1236,7 +1555,7 @@ static void IS_E2eeUnlockFlow(void) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [prog dismissViewControllerAnimated:YES completion:^{
                     if (err) IS_Alert(@"Couldn't unlock", err, nil);
-                    else IS_Alert(@"Unlocked", @"Encrypted messages will now be readable. Discord will close; reopen it to finish.", ^{ exit(0); });
+                    else IS_Alert(@"Unlocked", [(gUnlockNote ?: @"Encrypted messages are now readable and you can send encrypted messages.") stringByAppendingString:@" Discord will close; reopen it to finish."], ^{ exit(0); });
                 }];
             });
         });
@@ -1250,8 +1569,22 @@ static void IS_E2eeForgetFlow(void) {
         preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [a addAction:[UIAlertAction actionWithTitle:@"Forget key" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
-        IS_E2eeForget(gActive[@"id"]);
-        IS_Alert(@"Key removed", @"Discord will close. Reopen it to finish.", ^{ exit(0); });
+        NSString *iid = gActive[@"id"], *dev = IS_E2eeEntry()[@"dev_id"], *token = nil;
+        if (gTokLock) @synchronized (gTokLock) { token = gTok[iid]; }
+        NSURLComponents *b = IS_Parse(gActive[@"api"], @"https");
+        NSString *api = b.string;
+        while ([api hasSuffix:@"/"]) api = [api substringToIndex:api.length - 1];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            if (dev.length && token.length && api.length) {
+                NSInteger dc = 0;
+                IS_SyncJSON(@"DELETE", [NSString stringWithFormat:@"%@/v9/users/@me/e2ee/devices/%@", api, dev], token, nil, &dc, nil);
+                IS_Log(@"encryption: removed this device from the account (HTTP %ld)", (long)dc);
+            }
+            IS_E2eeForget(iid);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                IS_Alert(@"Key removed", @"Discord will close. Reopen it to finish.", ^{ exit(0); });
+            });
+        });
     }]];
     [IS_Top() presentViewController:a animated:YES completion:nil];
 }
@@ -1276,9 +1609,10 @@ static void IS_ShowMore(void) {
         IS_ToggleSetting(@"InstanceSwitcher.spoofPhone", !IS_SpoofPhone());
     }]];
     if (gActive) {
-        BOOL on = IS_E2eeActive();
-        [a addAction:[UIAlertAction actionWithTitle:on ? @"Encrypted messages: unlocked" : @"Unlock encrypted messages…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
-            if (on) IS_E2eeForgetFlow(); else IS_E2eeUnlockFlow();
+        BOOL on = IS_E2eeActive(), send = IS_E2eeCanSend();
+        NSString *title = !on ? @"Unlock encrypted messages…" : (send ? @"Encrypted messages: unlocked (sending on)" : @"Encrypted messages: read-only. Unlock again to send…");
+        [a addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            if (on && send) IS_E2eeForgetFlow(); else IS_E2eeUnlockFlow();
         }]];
     }
     [a addAction:[UIAlertAction actionWithTitle:@"Debug log…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { IS_ShowLog(); }]];
@@ -1495,13 +1829,19 @@ static NSString *const kISHandled = @"InstanceSwitcher.handled";
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
     NSDictionary *cur = gActive;
     if (!cur) return NO;
-    if (![request.HTTPMethod isEqualToString:@"GET"]) return NO;
+    BOOL post = [request.HTTPMethod isEqualToString:@"POST"];
+    if (!post && ![request.HTTPMethod isEqualToString:@"GET"]) return NO;
     if ([NSURLProtocol propertyForKey:kISHandled inRequest:request]) return NO;
     NSURL *u = request.URL;
     NSString *host = u.host.lowercaseString;
     NSURLComponents *b = IS_Parse(cur[@"api"], @"https");
     if (!host.length || !b || ![host isEqualToString:b.host.lowercaseString]) return NO;
     NSString *p = u.path ?: @"";
+    if (post) {     // outgoing messages (and file upload slots) in a channel: sealed here when the channel is encrypted
+        if (!IS_E2eeCanSend()) return NO;
+        if ([[request valueForHTTPHeaderField:@"Content-Type"].lowercaseString containsString:@"multipart"]) return NO;
+        return [p rangeOfString:@"^/api/v[0-9]+/channels/[0-9]+/(messages|attachments)$" options:NSRegularExpressionSearch].location != NSNotFound;
+    }
     if ([p hasPrefix:@"/e2ee/attachments/"]) return YES;
     if ([p hasPrefix:@"/api/"] && ([p containsString:@"/messages"] || [p hasSuffix:@"/pins"])) return YES;
     if ([p hasSuffix:@".svg"]) return YES;
@@ -1539,7 +1879,127 @@ static NSString *const kISHandled = @"InstanceSwitcher.handled";
     [self.client URLProtocolDidFinishLoading:self];
 }
 
+static NSData *IS_ReadStream(NSInputStream *in) {
+    if (!in) return nil;
+    NSMutableData *out = [NSMutableData data];
+    [in open];
+    uint8_t buf[8192];
+    NSInteger n;
+    while ((n = [in read:buf maxLength:sizeof buf]) > 0) {
+        [out appendBytes:buf length:(NSUInteger)n];
+        if (out.length > 4u * 1024 * 1024) break;
+    }
+    [in close];
+    return out;
+}
+
+- (void)failSend:(NSString *)why {
+    IS_Log(@"e2ee send: %@", why);
+    NSData *body = [NSJSONSerialization dataWithJSONObject:@{ @"code": @0, @"message": why } options:0 error:nil] ?: [NSData data];
+    [self relayStatus:400 headers:@{} body:body type:@"application/json"];
+}
+
+- (NSData *)syncSend:(NSURLRequest *)r response:(NSHTTPURLResponse **)resp error:(NSError **)err {
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSData *data = nil; __block NSHTTPURLResponse *h = nil; __block NSError *e = nil;
+    [[[ISImageProtocol innerSession] dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *rs, NSError *er) {
+        data = d; e = er; h = [rs isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)rs : nil;
+        dispatch_semaphore_signal(sem);
+    }] resume];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    if (resp) *resp = h;
+    if (err) *err = e;
+    return data;
+}
+
+// Hands the server's answer back to the app. Message bodies are decrypted on the way (our own sealed messages included).
+- (void)relaySend:(NSData *)data response:(NSHTTPURLResponse *)h error:(NSError *)err {
+    if (err || !h) { [self.client URLProtocol:self didFailWithError:err ?: [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:nil]]; return; }
+    NSString *ct = [[h valueForHTTPHeaderField:@"Content-Type"] lowercaseString] ?: @"";
+    if (h.statusCode == 200 && data.length && [ct containsString:@"json"]) {
+        NSString *t = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (t) {
+            NSString *rw = IS_RewriteInviteLinks(IS_E2eeProcess(t));
+            if (![rw isEqualToString:t]) data = [rw dataUsingEncoding:NSUTF8StringEncoding];
+        }
+    }
+    [self relayStatus:h.statusCode headers:h.allHeaderFields body:data ?: [NSData data] type:nil];
+}
+
+- (NSMutableURLRequest *)sendRequestWithBody:(NSData *)body {
+    NSMutableURLRequest *r = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:kISHandled inRequest:r];
+    r.HTTPBodyStream = nil;
+    r.HTTPBody = body;
+    [r setValue:@(body.length).stringValue forHTTPHeaderField:@"Content-Length"];
+    return r;
+}
+
+// POST /channels/<id>/messages and /attachments. Nothing in an encrypted channel is ever sent as plain text:
+// if the channel can't be classified, the message can't be sealed or the content isn't supported, the send fails here.
+- (void)sendMessage {
+    NSURLRequest *req = self.request;
+    NSData *body = req.HTTPBody ?: IS_ReadStream(req.HTTPBodyStream);
+    NSString *token = [req valueForHTTPHeaderField:@"Authorization"];
+    NSString *path = req.URL.path ?: @"";
+    NSRange rg = [path rangeOfString:@"/channels/"];
+    NSString *prefix = [path substringToIndex:rg.location];
+    NSArray *tail = [[path substringFromIndex:NSMaxRange(rg)] componentsSeparatedByString:@"/"];
+    NSString *channel = tail.firstObject;
+    BOOL isMessages = [tail.lastObject isEqualToString:@"messages"];
+    NSURLComponents *oc = [NSURLComponents componentsWithURL:req.URL resolvingAgainstBaseURL:NO];
+    oc.path = prefix; oc.query = nil; oc.fragment = nil;
+    NSString *base = oc.string;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @try {
+            if (!token.length) { [self sendUnchanged:body]; return; }
+            int enc = IS_E2eeIsEncrypted(base, token, channel);
+            if (enc < 0) { [self failSend:@"Couldn't tell whether this conversation is encrypted, so the message was not sent."]; return; }
+            if (enc == 0) { [self sendUnchanged:body]; return; }
+            if (!isMessages) { [self failSend:@"Files can't be sent encrypted from this tweak yet."]; return; }
+
+            id parsed = body.length ? [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingMutableContainers error:nil] : nil;
+            if (![parsed isKindOfClass:NSMutableDictionary.class]) { [self failSend:@"This kind of message can't be sent encrypted yet."]; return; }
+            NSMutableDictionary *obj = parsed;
+            NSString *no = IS_E2eeIneligible(obj);
+            if (no) { [self failSend:no]; return; }
+            id nv = obj[@"nonce"];
+            NSString *nonce = [nv isKindOfClass:NSString.class] ? nv : ([nv isKindOfClass:NSNumber.class] ? [nv stringValue] : nil);
+            if (!nonce.length) nonce = [NSString stringWithFormat:@"%lld%03u", (long long)([NSDate date].timeIntervalSince1970 * 1000), arc4random_uniform(1000)];
+
+            for (int attempt = 0; attempt < 2; attempt++) {
+                NSString *why = nil;
+                NSDictionary *env = IS_E2eeBuildEnvelope(base, token, channel, nonce, obj[@"content"], &why);
+                if (!env) { [self failSend:why ?: @"Couldn't encrypt the message."]; return; }
+                NSMutableDictionary *out = [obj mutableCopy];
+                out[@"encrypted"] = env;
+                out[@"content"] = kE2eeFallbackText;
+                out[@"nonce"] = nonce;
+                NSData *data = [NSJSONSerialization dataWithJSONObject:out options:NSJSONWritingWithoutEscapingSlashes error:nil];
+                if (!data.length) { [self failSend:@"Couldn't encode the message."]; return; }
+                NSHTTPURLResponse *h = nil; NSError *er = nil;
+                NSData *rd = [self syncSend:[self sendRequestWithBody:data] response:&h error:&er];
+                if (h.statusCode == 409 && attempt == 0) { IS_Log(@"e2ee send: the member devices changed, retrying with fresh keys"); continue; }
+                if (h.statusCode == 200) IS_LogOnce(@"e2ee:sent", @"sent an encrypted message");
+                else if (h) IS_Log(@"e2ee send: server answered %ld", (long)h.statusCode);
+                [self relaySend:rd response:h error:er];
+                return;
+            }
+        } @catch (NSException *e) {
+            [self failSend:[NSString stringWithFormat:@"Unexpected error (%@). The message was not sent.", e.reason]];
+        }
+    });
+}
+
+- (void)sendUnchanged:(NSData *)body {
+    NSHTTPURLResponse *h = nil; NSError *er = nil;
+    NSData *rd = [self syncSend:[self sendRequestWithBody:body ?: [NSData data]] response:&h error:&er];
+    [self relaySend:rd response:h error:er];
+}
+
 - (void)startLoading {
+    if ([self.request.HTTPMethod isEqualToString:@"POST"]) { [self sendMessage]; return; }
     NSURL *url = self.request.URL;
     NSString *key = url.absoluteString;
     NSString *path = url.path ?: @"";

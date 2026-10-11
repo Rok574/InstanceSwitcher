@@ -1,5 +1,6 @@
 #include "is_e2ee_core.h"
 #include "monocypher.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -624,4 +625,216 @@ int is_argon2id(const uint8_t *pw, size_t pw_len, const uint8_t *salt, size_t sa
     crypto_argon2(out, 32, work, cfg, in, crypto_argon2_no_extras);
     free(work);
     return 0;
+}
+
+/* --------------------------------------------------------- message envelope */
+
+typedef struct { char *p; size_t n, cap; int err; } sbuf;
+
+static void sb_put(sbuf *b, const char *s, size_t n) {
+    if (b->err) return;
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->n + n + 1) cap *= 2;
+        char *np = (char *)realloc(b->p, cap);
+        if (!np) { b->err = 1; return; }
+        b->p = np;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+
+static void sb_str(sbuf *b, const char *s) { sb_put(b, s, strlen(s)); }
+
+static void sb_int(sbuf *b, int64_t v) {
+    char t[32];
+    int n = snprintf(t, sizeof t, "%lld", (long long)v);
+    sb_put(b, t, (size_t)n);
+}
+
+// JSON string for a value already known to be [A-Za-z0-9_-] only (so nothing needs escaping).
+static void sb_q(sbuf *b, const char *s) { sb_put(b, "\"", 1); sb_str(b, s); sb_put(b, "\"", 1); }
+
+static int safe_token(const char *s) {
+    if (!s || !*s || strlen(s) > 128) return 0;
+    for (; *s; s++) {
+        char c = *s;
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '_')) return 0;
+    }
+    return 1;
+}
+
+static char *b64_alloc(const uint8_t *d, size_t n) {
+    size_t cap = (n / 3 + 1) * 4 + 1;
+    char *s = (char *)malloc(cap);
+    if (s && is_b64u_encode(d, n, s, cap) < 0) { free(s); return NULL; }
+    return s;
+}
+
+static int by_device(const is_env_target *t, size_t a, size_t b) { return strcmp(t[a].device_id, t[b].device_id); }
+static int by_user(const is_env_backup *t, size_t a, size_t b) { return strcmp(t[a].user_id, t[b].user_id); }
+
+char *is_e2ee_seal_envelope(const char *channel_id, const char *sender_user_id, const char *sender_device_id,
+                            const uint8_t device_seed[32], const char *nonce, const char *mid,
+                            const uint8_t *payload, size_t payload_len,
+                            const is_env_target *targets, size_t ntargets,
+                            const is_env_backup *backups, size_t nbackups) {
+    static const char ALG[] = "x25519-hpke-aes256gcm-ed25519";
+    static const char WRAP_INFO[] = "fosscord-e2ee/v1/wrap";
+    static const char BACKUP_INFO[] = "fosscord-e2ee/v1/backup-wrap";
+    if (!safe_token(channel_id) || !safe_token(sender_user_id) || !safe_token(sender_device_id) || !ntargets) return NULL;
+    if (mid ? !safe_token(mid) : !safe_token(nonce)) return NULL;
+    for (size_t i = 0; i < ntargets; i++)
+        if (!safe_token(targets[i].user_id) || !safe_token(targets[i].device_id) || targets[i].prekey_id < 0) return NULL;
+    for (size_t i = 0; i < nbackups; i++)
+        if (!safe_token(backups[i].user_id)) return NULL;
+
+    char *result = NULL, *iv_b = NULL, *ct_b = NULL, *aad = NULL, *bind = NULL;
+    char **t_enc = NULL, **t_wr = NULL, **b_enc = NULL, **b_wr = NULL;
+    size_t *t_ord = NULL, *b_ord = NULL;
+    uint8_t ckey[32], iv[12];
+    uint8_t *ct = NULL;
+    sbuf sp = {0}, env = {0};
+    int ok = 0;
+
+    t_enc = (char **)calloc(ntargets, sizeof *t_enc);
+    t_wr = (char **)calloc(ntargets, sizeof *t_wr);
+    t_ord = (size_t *)malloc(ntargets * sizeof *t_ord);
+    b_enc = (char **)calloc(nbackups + 1, sizeof *b_enc);
+    b_wr = (char **)calloc(nbackups + 1, sizeof *b_wr);
+    b_ord = (size_t *)malloc((nbackups + 1) * sizeof *b_ord);
+    ct = (uint8_t *)malloc(payload_len + 16);
+    size_t bl = strlen(mid ? mid : nonce) + 3;
+    bind = (char *)malloc(bl);
+    size_t al = 64 + strlen(channel_id) + strlen(sender_user_id) + strlen(sender_device_id) + bl;
+    aad = (char *)malloc(al);
+    if (!t_enc || !t_wr || !t_ord || !b_enc || !b_wr || !b_ord || !ct || !bind || !aad) goto done;
+    snprintf(bind, bl, "%s:%s", mid ? "m" : "n", mid ? mid : nonce);
+    snprintf(aad, al, "fosscord-e2ee/v1/msg\n%s\n%s\n%s\n%s", channel_id, sender_user_id, sender_device_id, bind);
+
+    if (is_random(ckey, 32) != 0 || is_random(iv, 12) != 0) goto done;
+    if (is_gcm_seal(ckey, iv, (const uint8_t *)aad, strlen(aad), payload, payload_len, ct) != (int)(payload_len + 16)) goto done;
+    iv_b = b64_alloc(iv, 12);
+    ct_b = b64_alloc(ct, payload_len + 16);
+    if (!iv_b || !ct_b) goto done;
+
+    for (size_t i = 0; i < ntargets; i++) {
+        size_t wl = strlen(aad) + strlen(targets[i].device_id) + 2;
+        char *waad = (char *)malloc(wl);
+        uint8_t enc[32], wrapped[48];
+        if (!waad) goto done;
+        snprintf(waad, wl, "%s\n%s", aad, targets[i].device_id);
+        int r = is_hpke_seal(targets[i].prekey_pub, (const uint8_t *)WRAP_INFO, sizeof WRAP_INFO - 1, (const uint8_t *)waad, strlen(waad), ckey, 32, enc, wrapped);
+        free(waad);
+        if (r != 48) goto done;
+        t_enc[i] = b64_alloc(enc, 32);
+        t_wr[i] = b64_alloc(wrapped, 48);
+        if (!t_enc[i] || !t_wr[i]) goto done;
+        t_ord[i] = i;
+    }
+    for (size_t i = 0; i < nbackups; i++) {
+        size_t wl = strlen(aad) + strlen(backups[i].user_id) + 10;
+        char *waad = (char *)malloc(wl);
+        uint8_t enc[32], wrapped[48];
+        if (!waad) goto done;
+        snprintf(waad, wl, "%s\nbackup:%s", aad, backups[i].user_id);
+        int r = is_hpke_seal(backups[i].pub, (const uint8_t *)BACKUP_INFO, sizeof BACKUP_INFO - 1, (const uint8_t *)waad, strlen(waad), ckey, 32, enc, wrapped);
+        free(waad);
+        if (r != 48) goto done;
+        b_enc[i] = b64_alloc(enc, 32);
+        b_wr[i] = b64_alloc(wrapped, 48);
+        if (!b_enc[i] || !b_wr[i]) goto done;
+        b_ord[i] = i;
+    }
+
+    for (size_t i = 1; i < ntargets; i++)
+        for (size_t j = i; j > 0 && by_device(targets, t_ord[j - 1], t_ord[j]) > 0; j--) { size_t x = t_ord[j]; t_ord[j] = t_ord[j - 1]; t_ord[j - 1] = x; }
+    for (size_t i = 1; i < nbackups; i++)
+        for (size_t j = i; j > 0 && by_user(backups, b_ord[j - 1], b_ord[j]) > 0; j--) { size_t x = b_ord[j]; b_ord[j] = b_ord[j - 1]; b_ord[j - 1] = x; }
+
+    // The signed text must match JSON.stringify of the same array in the web client byte for byte.
+    sb_str(&sp, "[\"fosscord-e2ee/v1/sig\",");
+    sb_q(&sp, channel_id); sb_put(&sp, ",", 1);
+    sb_q(&sp, sender_user_id); sb_put(&sp, ",", 1);
+    sb_q(&sp, bind); sb_str(&sp, ",1,");
+    sb_q(&sp, ALG); sb_put(&sp, ",", 1);
+    sb_q(&sp, sender_device_id); sb_put(&sp, ",", 1);
+    if (mid) sb_q(&sp, mid); else sb_str(&sp, "null");
+    sb_put(&sp, ",", 1);
+    sb_q(&sp, iv_b); sb_put(&sp, ",", 1);
+    sb_q(&sp, ct_b); sb_str(&sp, ",[");
+    for (size_t k = 0; k < ntargets; k++) {
+        size_t i = t_ord[k];
+        if (k) sb_put(&sp, ",", 1);
+        sb_put(&sp, "[", 1);
+        sb_q(&sp, targets[i].user_id); sb_put(&sp, ",", 1);
+        sb_q(&sp, targets[i].device_id); sb_put(&sp, ",", 1);
+        sb_int(&sp, targets[i].prekey_id); sb_put(&sp, ",", 1);
+        sb_q(&sp, t_enc[i]); sb_put(&sp, ",", 1);
+        sb_q(&sp, t_wr[i]); sb_put(&sp, "]", 1);
+    }
+    sb_put(&sp, "]", 1);
+    if (nbackups) {
+        sb_str(&sp, ",[");
+        for (size_t k = 0; k < nbackups; k++) {
+            size_t i = b_ord[k];
+            if (k) sb_put(&sp, ",", 1);
+            sb_put(&sp, "[", 1);
+            sb_q(&sp, backups[i].user_id); sb_put(&sp, ",", 1);
+            sb_q(&sp, b_enc[i]); sb_put(&sp, ",", 1);
+            sb_q(&sp, b_wr[i]); sb_put(&sp, "]", 1);
+        }
+        sb_put(&sp, "]", 1);
+    }
+    sb_put(&sp, "]", 1);
+    if (sp.err) goto done;
+
+    uint8_t sig[64];
+    is_ed25519_sign(device_seed, (const uint8_t *)sp.p, sp.n, sig);
+    char *sig_b = b64_alloc(sig, 64);
+    if (!sig_b) goto done;
+
+    sb_str(&env, "{\"v\":1,\"alg\":"); sb_q(&env, ALG);
+    sb_str(&env, ",\"sender_device\":"); sb_q(&env, sender_device_id);
+    if (mid) { sb_str(&env, ",\"mid\":"); sb_q(&env, mid); }
+    sb_str(&env, ",\"iv\":"); sb_q(&env, iv_b);
+    sb_str(&env, ",\"ct\":"); sb_q(&env, ct_b);
+    sb_str(&env, ",\"keys\":[");
+    for (size_t i = 0; i < ntargets; i++) {
+        if (i) sb_put(&env, ",", 1);
+        sb_str(&env, "{\"user_id\":"); sb_q(&env, targets[i].user_id);
+        sb_str(&env, ",\"device_id\":"); sb_q(&env, targets[i].device_id);
+        sb_str(&env, ",\"prekey_id\":"); sb_int(&env, targets[i].prekey_id);
+        sb_str(&env, ",\"enc\":"); sb_q(&env, t_enc[i]);
+        sb_str(&env, ",\"wrapped\":"); sb_q(&env, t_wr[i]); sb_put(&env, "}", 1);
+    }
+    sb_put(&env, "]", 1);
+    if (nbackups) {
+        sb_str(&env, ",\"backup\":[");
+        for (size_t i = 0; i < nbackups; i++) {
+            if (i) sb_put(&env, ",", 1);
+            sb_str(&env, "{\"user_id\":"); sb_q(&env, backups[i].user_id);
+            sb_str(&env, ",\"enc\":"); sb_q(&env, b_enc[i]);
+            sb_str(&env, ",\"wrapped\":"); sb_q(&env, b_wr[i]); sb_put(&env, "}", 1);
+        }
+        sb_put(&env, "]", 1);
+    }
+    sb_str(&env, ",\"sig\":"); sb_q(&env, sig_b); sb_put(&env, "}", 1);
+    free(sig_b);
+    if (env.err) goto done;
+    result = env.p;
+    env.p = NULL;
+    ok = 1;
+
+done:
+    crypto_wipe(ckey, 32);
+    free(sp.p);
+    free(env.p);
+    free(iv_b); free(ct_b); free(aad); free(bind); free(ct); free(t_ord); free(b_ord);
+    for (size_t i = 0; t_enc && i < ntargets; i++) { free(t_enc[i]); free(t_wr[i]); }
+    for (size_t i = 0; b_enc && i < nbackups; i++) { free(b_enc[i]); free(b_wr[i]); }
+    free(t_enc); free(t_wr); free(b_enc); free(b_wr);
+    return ok ? result : NULL;
 }
