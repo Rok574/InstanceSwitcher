@@ -1,0 +1,23 @@
+name: Build InstanceSwitcher.dylib
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dylib (arm64, iOS 14+)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=14.0 -isysroot "$SDK" \
+            -fobjc-arc -O2 -Wno-unused-function -dynamiclib \
+            -install_name @rpath/InstanceSwitcher.dylib \
+            -framework Foundation -framework UIKit -framework Security -framework CoreGraphics \
+            InstanceSwitcher.m is_e2ee_core.c monocypher.c \
+            -o InstanceSwitcher.dylib
+          file InstanceSwitcher.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InstanceSwitcher.dylib
+          path: InstanceSwitcher.dylib
