@@ -1,0 +1,38 @@
+name: Build FluxerRedirect dylib
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - FluxerRedirect.zip
+      - .github/workflows/build-fluxer-dylib.yml
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Download the zip
+        run: |
+          curl -fsSL -o FluxerRedirect.zip \
+            "https://github.com/Rok574/InstanceSwitcher/raw/refs/heads/main/FluxerRedirect.zip"
+          unzip -q -o FluxerRedirect.zip -d src
+          find src -name '*.m' -not -path '*/__MACOSX/*'
+
+      - name: Compile
+        run: |
+          SRC=$(find src -name 'FluxerRedirect.m' -not -path '*/__MACOSX/*' | head -n 1)
+          test -n "$SRC" || { echo "FluxerRedirect.m not found in zip"; exit 1; }
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=13.0 -isysroot "$SDK" \
+            -fobjc-arc -O2 -dynamiclib -install_name @rpath/FluxerRedirect.dylib \
+            -framework Foundation -framework UIKit -framework WebKit \
+            -o FluxerRedirect.dylib "$SRC"
+          codesign -f -s - FluxerRedirect.dylib
+          file FluxerRedirect.dylib
+          ls -la FluxerRedirect.dylib
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: FluxerRedirect.dylib
+          path: FluxerRedirect.dylib
